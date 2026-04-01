@@ -19,6 +19,13 @@ class ColumnMapping:
     speed: str
 
 
+@dataclass
+class DataOptions:
+    speed_unit: str
+    auto_scale_xy: bool
+    clamp_to_pitch: bool
+
+
 DEFAULT_SPRINT_THRESHOLD = 25.0
 PITCH_LENGTH = 105.0
 PITCH_WIDTH = 68.0
@@ -96,7 +103,7 @@ def load_csv(uploaded_file, delimiter: str, decimal_comma: bool) -> pd.DataFrame
     return df
 
 
-def normalize_data(df: pd.DataFrame, mapping: ColumnMapping) -> pd.DataFrame:
+def normalize_data(df: pd.DataFrame, mapping: ColumnMapping, options: DataOptions) -> pd.DataFrame:
     out = df.copy()
     out = out.rename(
         columns={
@@ -110,6 +117,21 @@ def normalize_data(df: pd.DataFrame, mapping: ColumnMapping) -> pd.DataFrame:
     out["x"] = pd.to_numeric(out["x"], errors="coerce")
     out["y"] = pd.to_numeric(out["y"], errors="coerce")
     out["speed"] = pd.to_numeric(out["speed"], errors="coerce")
+    if options.speed_unit == "m/s":
+        out["speed"] = out["speed"] * 3.6
+
+    if options.auto_scale_xy:
+        x_min, x_max = out["x"].min(), out["x"].max()
+        y_min, y_max = out["y"].min(), out["y"].max()
+        if pd.notna(x_min) and pd.notna(x_max) and x_max > x_min:
+            out["x"] = ((out["x"] - x_min) / (x_max - x_min)) * PITCH_LENGTH
+        if pd.notna(y_min) and pd.notna(y_max) and y_max > y_min:
+            out["y"] = ((out["y"] - y_min) / (y_max - y_min)) * PITCH_WIDTH
+
+    if options.clamp_to_pitch:
+        out["x"] = out["x"].clip(lower=0, upper=PITCH_LENGTH)
+        out["y"] = out["y"].clip(lower=0, upper=PITCH_WIDTH)
+
     out["time"] = pd.to_datetime(out["time"], errors="coerce")
     out = out.dropna(subset=["player", "x", "y", "speed"])
     out = out.sort_values(["player", "time"])
@@ -138,28 +160,27 @@ def build_pitch_figure(length: float, width: float) -> go.Figure:
 
 def add_heatmap(fig: go.Figure, player_df: pd.DataFrame) -> None:
     fig.add_trace(
-        go.Histogram2dContour(
+        go.Histogram2d(
             x=player_df["x"],
             y=player_df["y"],
             colorscale="YlOrRd",
-            contours=dict(showlabels=False),
-            ncontours=18,
-            opacity=0.9,
+            opacity=0.8,
             showscale=True,
             colorbar=dict(title="Densité"),
-            hovertemplate="x: %{x:.1f}m<br>y: %{y:.1f}m<extra></extra>",
+            xbins=dict(size=2.5),
+            ybins=dict(size=2.5),
         )
     )
 
 
 def sprint_vectors(player_df: pd.DataFrame, speed_threshold: float) -> pd.DataFrame:
     df = player_df.copy()
-    df = df[df["speed"] >= speed_threshold].copy()
-    if df.empty:
-        return df
+    if "time" in df.columns and df["time"].notna().any():
+        df = df.sort_values("time")
     df["next_x"] = df["x"].shift(-1)
     df["next_y"] = df["y"].shift(-1)
-    df = df.dropna(subset=["next_x", "next_y"])
+    df = df[df["speed"] >= speed_threshold].copy()
+    df = df.dropna(subset=["next_x", "next_y", "speed"])
     return df
 
 
@@ -220,7 +241,10 @@ def main() -> None:
         st.header("Paramètres")
         delimiter = st.selectbox("Séparateur CSV", [",", ";", "\\t"], index=0)
         decimal_comma = st.checkbox("Décimales avec virgule (,)", value=True)
-        sprint_threshold = st.slider("Seuil sprint (km/h)", 15.0, 40.0, DEFAULT_SPRINT_THRESHOLD, 0.5)
+        sprint_threshold = st.slider("Seuil sprint (km/h)", 10.0, 40.0, DEFAULT_SPRINT_THRESHOLD, 0.5)
+        speed_unit = st.selectbox("Unité vitesse", ["km/h", "m/s"], index=0)
+        auto_scale_xy = st.checkbox("Auto-remettre X/Y à l'échelle du terrain", value=True)
+        clamp_to_pitch = st.checkbox("Forcer les positions dans le terrain", value=True)
         pitch_length = st.number_input("Longueur terrain (m)", value=PITCH_LENGTH, min_value=40.0, max_value=130.0)
         pitch_width = st.number_input("Largeur terrain (m)", value=PITCH_WIDTH, min_value=20.0, max_value=100.0)
 
@@ -254,15 +278,24 @@ def main() -> None:
         speed_col = st.selectbox("Vitesse", cols, index=default_speed)
 
     mapping = ColumnMapping(player=player_col, time=time_col, x=x_col, y=y_col, speed=speed_col)
-    data = normalize_data(raw, mapping)
+    options = DataOptions(speed_unit=speed_unit, auto_scale_xy=auto_scale_xy, clamp_to_pitch=clamp_to_pitch)
+    data = normalize_data(raw, mapping, options)
     if data.empty:
         st.error("Aucune donnée exploitable après nettoyage. Vérifie le mapping et le format numérique.")
         return
 
     players = sorted(data["player"].dropna().unique().tolist())
-    selected_player = st.selectbox("Choisir un joueur", players, index=0)
-    player_df = data[data["player"] == selected_player].copy()
-    sprints = sprint_vectors(player_df, sprint_threshold)
+    selected_players = st.multiselect("Choisir un ou plusieurs joueurs", players, default=players[:1])
+    if not selected_players:
+        st.warning("Sélectionne au moins un joueur.")
+        return
+
+    player_df = data[data["player"].isin(selected_players)].copy()
+    sprints = (
+        player_df.groupby("player", group_keys=False)
+        .apply(lambda g: sprint_vectors(g, sprint_threshold))
+        .reset_index(drop=True)
+    )
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Événements", f"{len(player_df):,}".replace(",", " "))
@@ -274,6 +307,11 @@ def main() -> None:
     add_heatmap(fig, player_df)
     add_sprint_arrows(fig, sprints)
     st.plotly_chart(fig, use_container_width=True)
+
+    st.caption(
+        f"Joueurs sélectionnés: {len(selected_players)} | "
+        f"Plage vitesse: {player_df['speed'].min():.2f} à {player_df['speed'].max():.2f} km/h."
+    )
 
     st.subheader("Résumé multi-joueurs")
     report = build_report_table(data, sprint_threshold)
