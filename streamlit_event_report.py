@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.colors import sample_colorscale
 
 
 @dataclass
@@ -173,32 +174,80 @@ def add_heatmap(fig: go.Figure, player_df: pd.DataFrame) -> None:
     )
 
 
+def compute_zone_occupancy(player_df: pd.DataFrame, length: float, width: float, bins_x: int = 12, bins_y: int = 8) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    df = player_df.copy()
+    if df.empty:
+        x_edges = np.linspace(0, length, bins_x + 1)
+        y_edges = np.linspace(0, width, bins_y + 1)
+        return np.zeros((bins_y, bins_x)), x_edges, y_edges
+
+    if "time" in df.columns and df["time"].notna().any():
+        df = df.sort_values("time")
+        dt = df["time"].diff().dt.total_seconds().fillna(0.2)
+        dt = dt.clip(lower=0.0, upper=5.0)
+    else:
+        dt = pd.Series(np.full(len(df), 0.2), index=df.index)
+
+    x_edges = np.linspace(0, length, bins_x + 1)
+    y_edges = np.linspace(0, width, bins_y + 1)
+
+    x_idx = np.digitize(df["x"], x_edges) - 1
+    y_idx = np.digitize(df["y"], y_edges) - 1
+
+    zone = np.zeros((bins_y, bins_x), dtype=float)
+    for xi, yi, dti in zip(x_idx, y_idx, dt):
+        if 0 <= xi < bins_x and 0 <= yi < bins_y:
+            zone[yi, xi] += float(dti)
+    return zone, x_edges, y_edges
+
+
+def add_zone_heatmap(fig: go.Figure, zone: np.ndarray, x_edges: np.ndarray, y_edges: np.ndarray) -> None:
+    x_centers = (x_edges[:-1] + x_edges[1:]) / 2
+    y_centers = (y_edges[:-1] + y_edges[1:]) / 2
+    fig.add_trace(
+        go.Heatmap(
+            x=x_centers,
+            y=y_centers,
+            z=zone,
+            colorscale="YlOrRd",
+            opacity=0.7,
+            colorbar=dict(title="Temps (s)"),
+            hovertemplate="Zone x: %{x:.1f}m<br>Zone y: %{y:.1f}m<br>Temps: %{z:.1f}s<extra></extra>",
+        )
+    )
+
+
 def sprint_vectors(player_df: pd.DataFrame, speed_threshold: float) -> pd.DataFrame:
     df = player_df.copy()
     if "time" in df.columns and df["time"].notna().any():
         df = df.sort_values("time")
     df["next_x"] = df["x"].shift(-1)
     df["next_y"] = df["y"].shift(-1)
+    if "time" in df.columns and df["time"].notna().any():
+        df["dt_s"] = df["time"].shift(-1).sub(df["time"]).dt.total_seconds()
+    else:
+        df["dt_s"] = 0.2
+    df["distance_m"] = np.sqrt((df["next_x"] - df["x"]) ** 2 + (df["next_y"] - df["y"]) ** 2)
     df = df[df["speed"] >= speed_threshold].copy()
-    df = df.dropna(subset=["next_x", "next_y", "speed"])
+    df = df.dropna(subset=["next_x", "next_y", "speed", "distance_m"])
+    df = df[df["distance_m"] > 0]
     return df
 
 
-def add_sprint_arrows(fig: go.Figure, sprint_df: pd.DataFrame) -> None:
+def add_sprint_arrows(fig: go.Figure, sprint_df: pd.DataFrame, max_arrows: int = 400) -> None:
     if sprint_df.empty:
         return
-    fig.add_trace(
-        go.Scatter(
-            x=sprint_df["x"],
-            y=sprint_df["y"],
-            mode="markers",
-            marker=dict(size=7, color="#34D399"),
-            name="Départs sprint",
-            hovertemplate="Vitesse: %{customdata:.2f} km/h<extra></extra>",
-            customdata=sprint_df["speed"],
-        )
-    )
-    for row in sprint_df.itertuples():
+
+    if len(sprint_df) > max_arrows:
+        sprint_df = sprint_df.nlargest(max_arrows, "speed")
+
+    smin = float(sprint_df["speed"].min())
+    smax = float(sprint_df["speed"].max())
+    rng = smax - smin if smax > smin else 1.0
+
+    for row in sprint_df.itertuples(index=False):
+        scale_val = (float(row.speed) - smin) / rng
+        color = sample_colorscale("Turbo", scale_val)[0]
         fig.add_annotation(
             x=row.next_x,
             y=row.next_y,
@@ -211,10 +260,27 @@ def add_sprint_arrows(fig: go.Figure, sprint_df: pd.DataFrame) -> None:
             showarrow=True,
             arrowhead=2,
             arrowsize=1.1,
-            arrowwidth=1.5,
-            arrowcolor="#34D399",
-            opacity=0.85,
+            arrowwidth=1.0 + min(4.0, float(row.distance_m) / 4.0),
+            arrowcolor=color,
+            opacity=0.9,
+            hovertext=f"Vitesse: {row.speed:.2f} km/h<br>Distance: {row.distance_m:.2f} m",
         )
+    fig.add_trace(
+        go.Scatter(
+            x=sprint_df["x"],
+            y=sprint_df["y"],
+            mode="markers",
+            marker=dict(
+                size=np.clip(sprint_df["distance_m"], 5, 14),
+                color=sprint_df["speed"],
+                colorscale="Turbo",
+                showscale=True,
+                colorbar=dict(title="Vitesse sprint (km/h)"),
+            ),
+            name="Départs sprint",
+            hovertemplate="Vitesse: %{marker.color:.2f} km/h<br>Distance: %{marker.size:.2f} (taille)<extra></extra>",
+        )
+    )
 
 
 def build_report_table(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
@@ -248,12 +314,17 @@ def main() -> None:
         pitch_length = st.number_input("Longueur terrain (m)", value=PITCH_LENGTH, min_value=40.0, max_value=130.0)
         pitch_width = st.number_input("Largeur terrain (m)", value=PITCH_WIDTH, min_value=20.0, max_value=100.0)
 
-    uploaded = st.file_uploader("CSV tracking / événements", type=["csv"])
-    if uploaded is None:
-        st.info("Ajoute un fichier CSV pour générer le rapport.")
+    uploaded_files = st.file_uploader("CSV tracking / événements (1 fichier = 1 joueur)", type=["csv"], accept_multiple_files=True)
+    if not uploaded_files:
+        st.info("Ajoute un ou plusieurs CSV pour générer le rapport.")
         return
 
-    raw = load_csv(uploaded, delimiter, decimal_comma)
+    frames: list[pd.DataFrame] = []
+    for f in uploaded_files:
+        df_f = load_csv(f, delimiter, decimal_comma)
+        df_f["__source_file"] = f.name
+        frames.append(df_f)
+    raw = pd.concat(frames, ignore_index=True)
     st.write("Aperçu brut", raw.head(5))
 
     auto_mapping = suggest_mapping(raw)
@@ -285,17 +356,10 @@ def main() -> None:
         return
 
     players = sorted(data["player"].dropna().unique().tolist())
-    selected_players = st.multiselect("Choisir un ou plusieurs joueurs", players, default=players[:1])
-    if not selected_players:
-        st.warning("Sélectionne au moins un joueur.")
-        return
-
-    player_df = data[data["player"].isin(selected_players)].copy()
-    sprints = (
-        player_df.groupby("player", group_keys=False)
-        .apply(lambda g: sprint_vectors(g, sprint_threshold))
-        .reset_index(drop=True)
-    )
+    selected_player = st.selectbox("Choisir un joueur", players, index=0)
+    player_df = data[data["player"] == selected_player].copy()
+    sprints = sprint_vectors(player_df, sprint_threshold)
+    max_arrows = st.slider("Nombre max de flèches sprint", min_value=50, max_value=1200, value=400, step=50)
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Événements", f"{len(player_df):,}".replace(",", " "))
@@ -304,12 +368,13 @@ def main() -> None:
     k4.metric("Vitesse moyenne", f"{player_df['speed'].mean():.2f} km/h")
 
     fig = build_pitch_figure(length=pitch_length, width=pitch_width)
-    add_heatmap(fig, player_df)
-    add_sprint_arrows(fig, sprints)
+    zone, x_edges, y_edges = compute_zone_occupancy(player_df, pitch_length, pitch_width, bins_x=12, bins_y=8)
+    add_zone_heatmap(fig, zone, x_edges, y_edges)
+    add_sprint_arrows(fig, sprints, max_arrows=max_arrows)
     st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
-        f"Joueurs sélectionnés: {len(selected_players)} | "
+        f"Joueur sélectionné: {selected_player} | "
         f"Plage vitesse: {player_df['speed'].min():.2f} à {player_df['speed'].max():.2f} km/h."
     )
 
@@ -321,7 +386,7 @@ def main() -> None:
     st.download_button(
         "⬇️ Télécharger le résumé (CSV)",
         data=csv_data,
-        file_name=f"report_summary_{Path(uploaded.name).stem}.csv",
+        file_name="report_summary_players.csv",
         mime="text/csv",
     )
 
