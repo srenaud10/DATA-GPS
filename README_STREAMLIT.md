@@ -24,7 +24,7 @@ Tu peux importer **plusieurs CSV** (un par joueur).
 
 - Heatmap de position sur terrain.
 - Heatmap par zones (temps passé dans les zones du terrain).
-- Détection des sprints avec seuil configurable (25 km/h par défaut).
+- Détection des sprints avec seuil configurable (par défaut **7 m/s**).
 - Flèches de direction pour les événements de sprint (couleur = intensité, largeur = distance).
 - Liste déroulante pour sélectionner le joueur à étudier.
 - Conversion vitesse (m/s -> km/h) et remise à l'échelle automatique des coordonnées X/Y.

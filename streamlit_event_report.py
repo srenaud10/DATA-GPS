@@ -119,7 +119,10 @@ def normalize_data(df: pd.DataFrame, mapping: ColumnMapping, options: DataOption
     out["y"] = pd.to_numeric(out["y"], errors="coerce")
     out["speed"] = pd.to_numeric(out["speed"], errors="coerce")
     if options.speed_unit == "m/s":
+        out["speed_mps"] = out["speed"]
         out["speed"] = out["speed"] * 3.6
+    else:
+        out["speed_mps"] = out["speed"] / 3.6
 
     if options.auto_scale_xy:
         x_min, x_max = out["x"].min(), out["x"].max()
@@ -217,7 +220,7 @@ def add_zone_heatmap(fig: go.Figure, zone: np.ndarray, x_edges: np.ndarray, y_ed
     )
 
 
-def sprint_vectors(player_df: pd.DataFrame, speed_threshold: float) -> pd.DataFrame:
+def sprint_vectors(player_df: pd.DataFrame, speed_threshold_mps: float) -> pd.DataFrame:
     df = player_df.copy()
     if "time" in df.columns and df["time"].notna().any():
         df = df.sort_values("time")
@@ -228,8 +231,8 @@ def sprint_vectors(player_df: pd.DataFrame, speed_threshold: float) -> pd.DataFr
     else:
         df["dt_s"] = 0.2
     df["distance_m"] = np.sqrt((df["next_x"] - df["x"]) ** 2 + (df["next_y"] - df["y"]) ** 2)
-    df = df[df["speed"] >= speed_threshold].copy()
-    df = df.dropna(subset=["next_x", "next_y", "speed", "distance_m"])
+    df = df[df["speed_mps"] >= speed_threshold_mps].copy()
+    df = df.dropna(subset=["next_x", "next_y", "speed", "speed_mps", "distance_m"])
     df = df[df["distance_m"] > 0]
     return df
 
@@ -289,6 +292,7 @@ def build_report_table(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
             {
                 "events": len(g),
                 "max_speed_kmh": g["speed"].max(),
+                "max_speed_mps": g["speed_mps"].max(),
                 "avg_speed_kmh": g["speed"].mean(),
                 f"sprints_>{threshold:.0f}": int((g["speed"] >= threshold).sum()),
             }
@@ -307,17 +311,24 @@ def main() -> None:
         st.header("Paramètres")
         delimiter = st.selectbox("Séparateur CSV", [",", ";", "\\t"], index=0)
         decimal_comma = st.checkbox("Décimales avec virgule (,)", value=True)
-        sprint_threshold = st.slider("Seuil sprint (km/h)", 10.0, 40.0, DEFAULT_SPRINT_THRESHOLD, 0.5)
-        speed_unit = st.selectbox("Unité vitesse", ["km/h", "m/s"], index=0)
+        sprint_threshold_mps = st.slider("Seuil sprint (m/s)", 4.0, 12.0, 7.0, 0.1)
+        speed_unit = st.selectbox("Unité vitesse dans le CSV", ["m/s", "km/h"], index=0)
         auto_scale_xy = st.checkbox("Auto-remettre X/Y à l'échelle du terrain", value=True)
         clamp_to_pitch = st.checkbox("Forcer les positions dans le terrain", value=True)
         pitch_length = st.number_input("Longueur terrain (m)", value=PITCH_LENGTH, min_value=40.0, max_value=130.0)
         pitch_width = st.number_input("Largeur terrain (m)", value=PITCH_WIDTH, min_value=20.0, max_value=100.0)
 
-    uploaded_files = st.file_uploader("CSV tracking / événements (1 fichier = 1 joueur)", type=["csv"], accept_multiple_files=True)
+    uploaded_files = st.file_uploader(
+        "CSV tracking / événements (1 fichier = 1 joueur)",
+        type=["csv"],
+        accept_multiple_files=True,
+    )
     if not uploaded_files:
         st.info("Ajoute un ou plusieurs CSV pour générer le rapport.")
         return
+    if not isinstance(uploaded_files, list):
+        uploaded_files = [uploaded_files]
+    st.caption(f"Fichiers chargés: {len(uploaded_files)}")
 
     frames: list[pd.DataFrame] = []
     for f in uploaded_files:
@@ -358,13 +369,13 @@ def main() -> None:
     players = sorted(data["player"].dropna().unique().tolist())
     selected_player = st.selectbox("Choisir un joueur", players, index=0)
     player_df = data[data["player"] == selected_player].copy()
-    sprints = sprint_vectors(player_df, sprint_threshold)
+    sprints = sprint_vectors(player_df, sprint_threshold_mps)
     max_arrows = st.slider("Nombre max de flèches sprint", min_value=50, max_value=1200, value=400, step=50)
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Événements", f"{len(player_df):,}".replace(",", " "))
     k2.metric("Sprints détectés", f"{len(sprints):,}".replace(",", " "))
-    k3.metric("Vitesse max", f"{player_df['speed'].max():.2f} km/h")
+    k3.metric("Vitesse max", f"{player_df['speed'].max():.2f} km/h ({player_df['speed_mps'].max():.2f} m/s)")
     k4.metric("Vitesse moyenne", f"{player_df['speed'].mean():.2f} km/h")
 
     fig = build_pitch_figure(length=pitch_length, width=pitch_width)
@@ -375,11 +386,11 @@ def main() -> None:
 
     st.caption(
         f"Joueur sélectionné: {selected_player} | "
-        f"Plage vitesse: {player_df['speed'].min():.2f} à {player_df['speed'].max():.2f} km/h."
+        f"Plage vitesse: {player_df['speed_mps'].min():.2f} à {player_df['speed_mps'].max():.2f} m/s."
     )
 
     st.subheader("Résumé multi-joueurs")
-    report = build_report_table(data, sprint_threshold)
+    report = build_report_table(data, sprint_threshold_mps * 3.6)
     st.dataframe(report, use_container_width=True)
 
     csv_data = report.to_csv(index=False).encode("utf-8")
